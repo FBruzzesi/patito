@@ -6,10 +6,10 @@ from collections.abc import Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
-    cast,
 )
 
-import polars as pl
+import narwhals.stable.v1 as nw
+from narwhals.stable.v1.typing import IntoDataFrameT
 from pydantic.aliases import AliasGenerator
 from typing_extensions import get_args
 
@@ -25,36 +25,31 @@ from patito.exceptions import (
     SuperfluousColumnsError,
 )
 
-try:
-    import pandas as pd  # type: ignore
-
-    _PANDAS_AVAILABLE = True
-except ImportError:
-    _PANDAS_AVAILABLE = False
-
 if TYPE_CHECKING:
     from patito import Model
 
 
 VALID_POLARS_TYPES = {
-    "enum": {pl.Categorical},
-    "boolean": {pl.Boolean},
-    "string": {pl.String, pl.Datetime, pl.Date},
-    "number": {pl.Float32, pl.Float64},
+    "enum": {nw.Categorical},
+    "boolean": {nw.Boolean},
+    "string": {nw.String, nw.Datetime, nw.Date},
+    "number": {nw.Float32, nw.Float64},
     "integer": {
-        pl.Int8,
-        pl.Int16,
-        pl.Int32,
-        pl.Int64,
-        pl.UInt8,
-        pl.UInt16,
-        pl.UInt32,
-        pl.UInt64,
+        nw.Int8,
+        nw.Int16,
+        nw.Int32,
+        nw.Int64,
+        nw.UInt8,
+        nw.UInt16,
+        nw.UInt32,
+        nw.UInt64,
     },
 }
 
 
-def _transform_df(dataframe: pl.DataFrame, schema: type[Model]) -> pl.DataFrame:
+def _transform_df(
+    dataframe: nw.DataFrame[Any], schema: type[Model]
+) -> nw.DataFrame[Any]:
     """Transform any properties of the dataframe according to the model.
 
     Currently only supports using AliasGenerator to transform column names to match a model.
@@ -74,15 +69,14 @@ def _transform_df(dataframe: pl.DataFrame, schema: type[Model]) -> pl.DataFrame:
         else:  # alias_gen is a function
             alias_func = alias_gen
 
-        new_cols: list[str] = [
-            alias_func(field_name) for field_name in dataframe.columns
-        ]  # type: ignore
-        dataframe.columns = new_cols
+        return dataframe.rename(
+            {field_name: alias_func(field_name) for field_name in dataframe.columns}
+        )  # type: ignore
     return dataframe
 
 
 def _find_errors(  # noqa: C901
-    dataframe: pl.DataFrame,
+    dataframe: nw.DataFrame,
     schema: type[Model],
     columns: Sequence[str] | None = None,
     allow_missing_columns: bool = False,
@@ -156,7 +150,7 @@ def _find_errors(  # noqa: C901
     for column, dtype in schema.dtypes.items():
         if column not in column_subset:
             continue
-        if not isinstance(dtype, pl.List):
+        if not isinstance(dtype, nw.List):
             continue
 
         annotation = schema.model_fields[column].annotation  # type: ignore[unreachable]
@@ -174,13 +168,13 @@ def _find_errors(  # noqa: C901
             dataframe.lazy()
             .select(column)
             # Remove those rows that do not contain lists at all
-            .filter(pl.col(column).is_not_null())
+            .filter(~nw.col(column).is_null())
             # Remove empty lists
-            .filter(pl.col(column).list.len() > 0)
+            .filter(nw.col(column).list.len() > 0)
             # Convert lists of N items to N individual rows
             .explode(column)
             # Calculate how many nulls are present in lists
-            .filter(pl.col(column).is_null())
+            .filter(nw.col(column).is_null())
             .collect()
             .height
         )
@@ -198,7 +192,7 @@ def _find_errors(  # noqa: C901
 
     # Check if any column has a wrong dtype
     valid_dtypes = schema.valid_dtypes
-    dataframe_datatypes = dict(zip(dataframe.columns, dataframe.dtypes))
+    dataframe_datatypes = dataframe.columns, dataframe.collect_schema()
     for column_name, column_properties in schema._schema_properties().items():
         # We rename to _tmp here to avoid overwriting the dataframe during filters below
         # TODO! Really we should be passing *Series* around rather than the entire dataframe
@@ -209,8 +203,8 @@ def _find_errors(  # noqa: C901
 
         polars_type = dataframe_datatypes[column_name]
         if polars_type not in [
-            pl.Struct,
-            pl.List(pl.Struct),
+            nw.Struct,
+            nw.List(nw.Struct),
         ]:  # defer struct validation for recursive call to _find_errors later
             if polars_type not in valid_dtypes[column_name]:
                 errors.append(
@@ -244,7 +238,7 @@ def _find_errors(  # noqa: C901
                 )
 
         # Intercept struct columns, and process errors separately
-        if schema.dtypes[column_name] == pl.Struct:
+        if schema.dtypes[column_name] == nw.Struct:
             nested_schema = schema.model_fields[column_name].annotation
             assert nested_schema is not None
             # Additional unpack required if structs column is optional
@@ -261,8 +255,8 @@ def _find_errors(  # noqa: C901
                 # The following code has been added to accomodate this
 
                 struct_fields = dataframe_tmp[column_name].struct.fields
-                col_struct = pl.col(column_name).struct
-                only_non_null_expr = ~pl.all_horizontal(
+                col_struct = nw.col(column_name).struct
+                only_non_null_expr = ~nw.all_horizontal(
                     [col_struct.field(name).is_null() for name in struct_fields]
                 )
                 dataframe_tmp = dataframe_tmp.filter(only_non_null_expr)
@@ -284,15 +278,15 @@ def _find_errors(  # noqa: C901
             continue
 
         # Intercept list of structs columns, and process errors separately
-        elif schema.dtypes[column_name] == pl.List(pl.Struct):
+        elif schema.dtypes[column_name] == nw.List(nw.Struct):
             list_annotation = schema.model_fields[column_name].annotation
             assert list_annotation is not None
 
-            # Handle Optional[list[pl.Struct]]
+            # Handle Optional[list[nw.Struct]]
             if is_optional(list_annotation):
                 list_annotation = unwrap_optional(list_annotation)
 
-                dataframe_tmp = dataframe_tmp.filter(pl.col(column_name).is_not_null())
+                dataframe_tmp = dataframe_tmp.filter(~nw.col(column_name).is_null())
                 if dataframe_tmp.is_empty():
                     continue
 
@@ -305,11 +299,11 @@ def _find_errors(  # noqa: C901
                 .unnest(column_name)
             )
 
-            # Handle list[Optional[pl.Struct]]
+            # Handle list[Optional[nw.Struct]]
             if is_optional(nested_schema):
                 nested_schema = unwrap_optional(nested_schema)
 
-                dataframe_tmp = dataframe_tmp.filter(pl.all().is_not_null())
+                dataframe_tmp = dataframe_tmp.filter(~nw.all().is_null())
                 if dataframe_tmp.is_empty():
                     continue
 
@@ -328,7 +322,7 @@ def _find_errors(  # noqa: C901
             continue
 
         # Check for bounded value fields
-        col = pl.col(column_name)
+        col = nw.col(column_name)
         filters = {
             "maximum": lambda v, col=col: col <= v,
             "exclusiveMaximum": lambda v, col=col: col < v,
@@ -362,7 +356,7 @@ def _find_errors(  # noqa: C901
                     ~check
                 )  # get failing rows (nulls will evaluate to null on boolean check, we only want failures (false)))
                 invalid_rows = lazy_df.collect()
-                n_invalid_rows += invalid_rows.height
+                n_invalid_rows += invalid_rows.shape[0]
             if n_invalid_rows > 0:
                 errors.append(
                     ErrorWrapper(
@@ -376,24 +370,24 @@ def _find_errors(  # noqa: C901
 
         if column_info.constraints is not None:
             custom_constraints = column_info.constraints
-            if isinstance(custom_constraints, pl.Expr):
+            if isinstance(custom_constraints, nw.Expr):
                 custom_constraints = [custom_constraints]
-            constraints = pl.any_horizontal(
-                [constraint.not_() for constraint in custom_constraints]
+            constraints = nw.any_horizontal(
+                [~constraint for constraint in custom_constraints]
             )
             if "_" in constraints.meta.root_names():
                 # An underscore is an alias for the current field
                 illegal_rows = dataframe_tmp.with_columns(
-                    pl.col(column_name).alias("_")
+                    nw.col(column_name).alias("_")
                 ).filter(constraints)
             else:
                 illegal_rows = dataframe_tmp.filter(constraints)
-            if illegal_rows.height > 0:
+            if (n_illegal_rows := illegal_rows.shape[0]) > 0:
                 errors.append(
                     ErrorWrapper(
                         RowValueError(
-                            f"{illegal_rows.height} "
-                            f"row{'' if illegal_rows.height == 1 else 's'} "
+                            f"{n_illegal_rows} "
+                            f"row{'' if n_illegal_rows == 1 else 's'} "
                             "does not match custom constraints."
                         ),
                         loc=column_name,
@@ -404,7 +398,7 @@ def _find_errors(  # noqa: C901
 
 
 def _find_enum_errors(
-    df: pl.DataFrame, column_name: str, props: dict[str, Any], schema: type[Model]
+    df: nw.DataFrame, column_name: str, props: dict[str, Any], schema: type[Model]
 ) -> ErrorWrapper | None:
     if "enum" not in props:
         if "items" in props and "enum" in props["items"]:
@@ -425,7 +419,7 @@ def _find_enum_errors(
     permissible_values = set(props["enum"])
     if column_name in schema.nullable_columns:
         permissible_values.add(None)
-    if isinstance(df[column_name].dtype, pl.List):
+    if isinstance(df[column_name].dtype, nw.List):
         actual_values = set(df[column_name].explode().unique())
     else:
         actual_values = set(df[column_name].unique())
@@ -439,13 +433,13 @@ def _find_enum_errors(
 
 
 def validate(
-    dataframe: pd.DataFrame | pl.DataFrame,
+    dataframe: IntoDataFrameT,
     schema: type[Model],
     columns: Sequence[str] | None = None,
     allow_missing_columns: bool = False,
     allow_superfluous_columns: bool = False,
     drop_superfluous_columns: bool = False,
-) -> pl.DataFrame:
+) -> IntoDataFrameT:
     """Validate the given dataframe.
 
     Args:
@@ -466,20 +460,16 @@ def validate(
             "Cannot specify both 'columns' and 'drop_superfluous_columns'."
         )
 
-    if _PANDAS_AVAILABLE and isinstance(dataframe, pd.DataFrame):
-        polars_dataframe = pl.from_pandas(dataframe)
-    else:
-        polars_dataframe = cast(pl.DataFrame, dataframe).clone()
-
-    polars_dataframe = _transform_df(polars_dataframe, schema)
+    nw_dataframe = nw.from_native(dataframe, strict=True, eager_only=True)
+    nw_dataframe = _transform_df(nw_dataframe, schema)
 
     if drop_superfluous_columns:
         # NOTE: dropping rather than selecting to get the correct error messages
-        to_drop = set(dataframe.columns) - set(schema.columns)
-        polars_dataframe = polars_dataframe.drop(to_drop)
+        to_drop = set(nw_dataframe.columns) - set(schema.columns)
+        nw_dataframe = nw_dataframe.drop(to_drop)
 
     errors = _find_errors(
-        dataframe=polars_dataframe,
+        dataframe=nw_dataframe,
         schema=schema,
         columns=columns,
         allow_missing_columns=allow_missing_columns,
@@ -488,4 +478,4 @@ def validate(
     if errors:
         raise DataFrameValidationError(errors=errors, model=schema)
 
-    return polars_dataframe
+    return nw_dataframe.to_native()

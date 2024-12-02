@@ -18,8 +18,9 @@ from typing import (
 )
 from zoneinfo import ZoneInfo
 
-import polars as pl
-from polars.datatypes import DataType, DataTypeClass
+import narwhals.stable.v1 as nw
+from narwhals.stable.v1.dtypes import DType
+from narwhals.stable.v1.typing import IntoDataFrame, IntoDataFrameT
 from pydantic import (  # noqa: F401
     BaseModel,
     create_model,
@@ -41,14 +42,9 @@ from patito._pydantic.schema import column_infos_for_model, schema_for_model
 from patito.polars import DataFrame, LazyFrame, ModelGenerator
 from patito.validators import validate
 
-try:
-    import pandas as pd  # type: ignore
-
-    _PANDAS_AVAILABLE = True
-except ImportError:
-    _PANDAS_AVAILABLE = False
-
 if TYPE_CHECKING:
+    import pandas as pd
+
     import patito.polars
 
 # The generic type of a single row in given Relation.
@@ -135,7 +131,7 @@ class ModelMetaclass(PydanticModelMetaclass):
         return list(cls.model_fields.keys())
 
     @property
-    def dtypes(cls: type[Model]) -> dict[str, DataTypeClass | DataType]:
+    def dtypes(cls: type[Model]) -> dict[str, type[DType] | DType]:
         """Return the polars dtypes of the dataframe.
 
         Unless Field(dtype=...) is specified, the highest signed column dtype
@@ -160,7 +156,7 @@ class ModelMetaclass(PydanticModelMetaclass):
     @property
     def valid_dtypes(
         cls: type[Model],
-    ) -> Mapping[str, frozenset[DataTypeClass | DataType]]:
+    ) -> Mapping[str, frozenset[type[DType] | DType]]:
         """Return a list of polars dtypes which Patito considers valid for each field.
 
         The first item of each list is the default dtype chosen by Patito.
@@ -302,7 +298,7 @@ class Model(BaseModel, metaclass=ModelMetaclass):
     @classmethod
     def from_row(
         cls: type[ModelType],
-        row: pd.DataFrame | pl.DataFrame,
+        row: IntoDataFrameT,
         validate: bool = True,
     ) -> ModelType:
         """Represent a single data frame row as a Patito model.
@@ -338,20 +334,20 @@ class Model(BaseModel, metaclass=ModelMetaclass):
             Product(product_id='1', name='product name', price='1.22')
 
         """
-        if isinstance(row, pl.DataFrame):
-            dataframe = row
-        elif _PANDAS_AVAILABLE and isinstance(row, pd.DataFrame):
-            dataframe = pl.DataFrame._from_pandas(row)
-        elif _PANDAS_AVAILABLE and isinstance(row, pd.Series):
+        if isinstance(
+            (dataframe := nw.from_native(row, pass_through=True, eager_only=True)),
+            nw.DataFrame,
+        ):
+            return cls._from_narwhals(dataframe=dataframe, validate=validate)
+        elif nw.dependencies.is_pandas_like_series(row):
             return cls(**dict(row.items()))  # type: ignore[unreachable]
         else:
             raise TypeError(f"{cls.__name__}.from_row not implemented for {type(row)}.")
-        return cls._from_polars(dataframe=dataframe, validate=validate)
 
     @classmethod
-    def _from_polars(
+    def _from_narwhals(
         cls: type[ModelType],
-        dataframe: pl.DataFrame,
+        dataframe: nw.DataFrame,
         validate: bool = True,
     ) -> ModelType:
         """Construct model from a single polars row.
@@ -391,28 +387,28 @@ class Model(BaseModel, metaclass=ModelMetaclass):
             Product(product_id='1', name='product name', price='1.22')
 
         """
-        if not isinstance(dataframe, pl.DataFrame):
+        if not isinstance(dataframe, nw.DataFrame):
             raise TypeError(
-                f"{cls.__name__}._from_polars() must be invoked with polars.DataFrame, "
+                f"{cls.__name__}._from_narwhals() must be invoked with polars.DataFrame, "
                 f"not {type(dataframe)}!"
             )
         elif len(dataframe) != 1:
             raise ValueError(
-                f"{cls.__name__}._from_polars() can only be invoked with exactly "
+                f"{cls.__name__}._from_narwhals() can only be invoked with exactly "
                 f"1 row, while {len(dataframe)} rows were provided."
             )
 
         # We have been provided with a single polars.DataFrame row
         # Convert to the equivalent keyword invocation of the pydantic model
         if validate:
-            return cls(**dataframe.to_dicts()[0])
+            return cls(**next(dataframe.iter_rows(named=True)))
         else:
-            return cls.model_construct(**dataframe.to_dicts()[0])
+            return cls.model_construct(**next(dataframe.iter_rows(named=True)))
 
     @classmethod
     def validate(
         cls: type[ModelType],
-        dataframe: pd.DataFrame | pl.DataFrame,
+        dataframe: IntoDataFrame,
         columns: Sequence[str] | None = None,
         allow_missing_columns: bool = False,
         allow_superfluous_columns: bool = False,
@@ -478,7 +474,7 @@ class Model(BaseModel, metaclass=ModelMetaclass):
 
     @classmethod
     def iter_models(
-        cls: type[ModelType], dataframe: pd.DataFrame | pl.DataFrame
+        cls: type[ModelType], dataframe: IntoDataFrame
     ) -> ModelGenerator[ModelType]:
         """Validate the dataframe and iterate over the rows, yielding Patito models.
 
@@ -589,7 +585,7 @@ class Model(BaseModel, metaclass=ModelMetaclass):
             # If the dtype is an unsigned integer type, we must return a positive value
             if info.dtype:
                 dtype = info.dtype
-                if dtype in (pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+                if dtype in {nw.UInt8, nw.UInt16, nw.UInt32, nw.UInt64}:
                     lower = 0 if lower is None else max(lower, 0)
 
             # First we check the simple case, no upper or lower bound
@@ -756,7 +752,7 @@ class Model(BaseModel, metaclass=ModelMetaclass):
             1          -1  product B              dry
 
         """
-        if not _PANDAS_AVAILABLE:
+        if not nw.dependencies.get_pandas():
             # Re-trigger the import error, but this time don't catch it
             raise ImportError("No module named 'pandas'")
 
@@ -857,18 +853,18 @@ class Model(BaseModel, metaclass=ModelMetaclass):
         if wrong_columns:
             raise TypeError(f"{cls.__name__} does not contain fields {wrong_columns}!")
 
-        series: list[pl.Series | pl.Expr] = []
+        series: list[nw.Series | nw.Expr] = []
         unique_series = []
         for column_name, dtype in cls.dtypes.items():
             if column_name not in kwargs:
                 if column_name in cls.unique_columns:
                     unique_series.append(
-                        pl.first().cum_count().cast(dtype).alias(column_name)
+                        nw.first().cum_count().cast(dtype).alias(column_name)
                     )
                 else:
                     example_value = cls.example_value(field=column_name)
                     series.append(
-                        pl.Series(column_name, values=[example_value], dtype=dtype)
+                        # TODO nw.Series(column_name, values=[example_value], dtype=dtype)
                     )
                 continue
 
@@ -879,7 +875,7 @@ class Model(BaseModel, metaclass=ModelMetaclass):
                 # series and literate values.
                 series.insert(0, pl.Series(name=column_name, values=value, dtype=dtype))
             else:
-                series.append(pl.lit(value, dtype=dtype).alias(column_name))
+                series.append(nw.lit(value, dtype=dtype).alias(column_name))
 
         return cls.DataFrame().with_columns(series).with_columns(unique_series)
 
